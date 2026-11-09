@@ -335,6 +335,8 @@ class HerderImpl : public Herder
     void trackingHeartBeat();
 
     VirtualTimer mTriggerTimer;
+    // Live pipelining: timer for the next slot's nomination.
+    VirtualTimer mPipelineTimer;
 
     VirtualTimer mOutOfSyncTimer;
 
@@ -398,6 +400,20 @@ class HerderImpl : public Herder
     // network or not (Herder::State is used to properly track the state of
     // Herder) On startup, this variable is set to LCL
     ConsensusData mTrackingSCP;
+
+    // Live pipelining (EXPERIMENTAL_LIVE_PIPELINE_DEPTH = k >= 2): the last
+    // externalized ledger and value (a lower bound for the close time this
+    // node proposes), the slot the pipeline timer was set for, and a slot
+    // waiting for its base ledger N-k to apply.
+    uint32_t mPipelineExternalizedLedger{0};
+    StellarValue mPipelineExternalizedValue;
+    uint32_t mPipelineScheduledLedger{0};
+    uint32_t mPipelineWaitingLedger{0};
+    // EXPERIMENTAL_TEST_TX_LATENCY: when this node first received each queued
+    // transaction.
+    std::unordered_map<Hash, int64_t> mTestTxSeen;
+    void pipelineSchedule(uint32_t ledgerSeq, VirtualClock::time_point when);
+    void pipelineFire(uint32_t ledgerSeq);
 
     uint32_t mMaxTxSize{0};
 

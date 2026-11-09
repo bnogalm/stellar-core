@@ -10195,3 +10195,251 @@ TEST_CASE("info reports the ms close time", "[herder]")
     // closeTimeMs is the full close time in ms, not just the ms remainder
     REQUIRE(ledgerInfo["closeTimeMs"].asUInt64() == T * 1000 + 250);
 }
+
+TEST_CASE("live pipelining keeps the network in agreement",
+          "[herder][pipelining]")
+{
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    uint32_t const depth = GENERATE(2, 3);
+    bool const parallelApply = GENERATE(false, true);
+    CAPTURE(depth, parallelApply);
+
+    auto simulation = Topologies::core(
+        4, 0.75, Simulation::OVER_LOOPBACK, networkID, [&](int i) {
+            auto cfg = getTestConfig(i, Config::TESTDB_BUCKET_DB_PERSISTENT);
+            cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH = depth;
+            cfg.PARALLEL_LEDGER_APPLY = parallelApply;
+            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
+            cfg.GENESIS_TEST_ACCOUNT_COUNT = 200;
+            return cfg;
+        });
+    simulation->startAllNodes();
+    auto nodes = simulation->getNodes();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(8, 2); },
+        30 * simulation->getExpectedLedgerCloseTime(), false);
+
+    // Payments from every account, so every slot class gets transactions
+    auto& loadGen = nodes[0]->getLoadGenerator();
+    auto& loadGenDone =
+        nodes[0]->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
+    auto const done = loadGenDone.count();
+    loadGen.generateLoad(GeneratedLoadConfig::txLoad(LoadGenMode::PAY, 200,
+                                                     /* nTxs */ 200,
+                                                     /* txRate */ 10));
+    simulation->crankUntil([&]() { return loadGenDone.count() > done; },
+                           200 * simulation->getExpectedLedgerCloseTime(),
+                           false);
+    REQUIRE(loadGenDone.count() > done);
+    auto& loadGenFailed =
+        nodes[0]->getMetrics().NewMeter({"loadgen", "run", "failed"}, "run");
+    REQUIRE(loadGenFailed.count() == 0);
+
+    // Every node applied the same ledgers
+    uint32_t target = 0;
+    for (auto const& node : nodes)
+    {
+        target =
+            std::max(target, node->getLedgerManager().getLastClosedLedgerNum());
+    }
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(target + 2, 1); },
+        10 * simulation->getExpectedLedgerCloseTime(), false);
+    for (uint32_t seq = target - depth; seq <= target; ++seq)
+    {
+        auto const hash = nodes[0]->getLedgerManager().getRecentLedgerHash(seq);
+        REQUIRE(hash);
+        for (auto const& node : nodes)
+        {
+            REQUIRE(node->getLedgerManager().getRecentLedgerHash(seq) == hash);
+        }
+    }
+    auto& applied =
+        nodes[0]->getMetrics().NewCounter({"ledger", "apply", "success"});
+    REQUIRE(applied.count() >= 200);
+}
+
+TEST_CASE("live pipelining across an upgrade and a restart",
+          "[herder][pipelining]")
+{
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    uint32_t const depth = GENERATE(2, 3);
+    CAPTURE(depth);
+
+    auto simulation = Topologies::core(
+        4, 0.75, Simulation::OVER_LOOPBACK, networkID, [&](int i) {
+            auto cfg = getTestConfig(i, Config::TESTDB_BUCKET_DB_PERSISTENT);
+            cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH = depth;
+            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
+            cfg.GENESIS_TEST_ACCOUNT_COUNT = 200;
+            return cfg;
+        });
+    simulation->startAllNodes();
+    auto closeTime = simulation->getExpectedLedgerCloseTime();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(8, 2); }, 30 * closeTime,
+        false);
+
+    auto runLoad = [&](Application& app) {
+        auto& done =
+            app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
+        auto const before = done.count();
+        app.getLoadGenerator().generateLoad(GeneratedLoadConfig::txLoad(
+            LoadGenMode::PAY, 200, /* nTxs */ 200, /* txRate */ 10));
+        simulation->crankUntil([&]() { return done.count() > before; },
+                               200 * closeTime, false);
+        REQUIRE(done.count() > before);
+        REQUIRE(app.getMetrics()
+                    .NewMeter({"loadgen", "run", "failed"}, "run")
+                    .count() == 0);
+    };
+    // Every node applied the same last few ledgers
+    auto requireAgreement = [&]() {
+        auto nodes = simulation->getNodes();
+        uint32_t target = 0;
+        for (auto const& node : nodes)
+        {
+            target = std::max(
+                target, node->getLedgerManager().getLastClosedLedgerNum());
+        }
+        simulation->crankUntil(
+            [&]() { return simulation->haveAllExternalized(target + 2, 1); },
+            10 * closeTime, false);
+        for (uint32_t seq = target - depth; seq <= target; ++seq)
+        {
+            auto const hash =
+                nodes[0]->getLedgerManager().getRecentLedgerHash(seq);
+            REQUIRE(hash);
+            for (auto const& node : nodes)
+            {
+                REQUIRE(node->getLedgerManager().getRecentLedgerHash(seq) ==
+                        hash);
+            }
+        }
+    };
+
+    SECTION("config upgrade under load")
+    {
+        // The upgrade goes in a ledger that is a multiple of k and the next
+        // k - 1 apply empty; their transactions must stay queued, or the
+        // load generator would not see them applied.
+        Upgrades::UpgradeParameters upgrade;
+        upgrade.mUpgradeTime =
+            VirtualClock::from_time_t(simulation->getNodes()[0]
+                                          ->getLedgerManager()
+                                          .getLastClosedLedgerHeader()
+                                          .header.scpValue.closeTime);
+        upgrade.mMaxTxSetSize = 120;
+        for (auto const& node : simulation->getNodes())
+        {
+            node->getHerder().setUpgrades(upgrade);
+        }
+        runLoad(*simulation->getNodes()[0]);
+        requireAgreement();
+        for (auto const& node : simulation->getNodes())
+        {
+            REQUIRE(node->getLedgerManager()
+                        .getLastClosedLedgerHeader()
+                        .header.maxTxSetSize == 120);
+        }
+    }
+
+    SECTION("restart a validator")
+    {
+        // After a restart the node doesn't keep the states of the ledgers
+        // before its LCL, so it waits until it can validate again.
+        auto const id = simulation->getNodeIDs()[3];
+        auto cfg = simulation->getNode(id)->getConfig();
+        auto const key = cfg.NODE_SEED;
+        auto const qSet = cfg.QUORUM_SET;
+        simulation->removeNode(id);
+        simulation->crankForAtLeast(3 * closeTime, false);
+        auto restarted = simulation->addNode(key, qSet, &cfg, false);
+        restarted->start();
+        for (auto const& other : simulation->getNodeIDs())
+        {
+            if (!(other == id))
+            {
+                simulation->addConnection(other, id);
+            }
+        }
+        runLoad(*simulation->getNodes()[0]);
+        requireAgreement();
+    }
+}
+
+TEST_CASE("live pipelining switched on at a restart of all validators",
+          "[herder][pipelining]")
+{
+    // As on a test network: run without pipelining, stop every validator at
+    // the same ledger, and start them again with k ledgers in consensus. The
+    // first k - 1 ledgers after the switch are built on that ledger, since no
+    // node keeps the states before it.
+    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    uint32_t const depth = GENERATE(2, 3);
+    CAPTURE(depth);
+
+    auto simulation = Topologies::core(
+        4, 0.75, Simulation::OVER_LOOPBACK, networkID, [&](int i) {
+            auto cfg = getTestConfig(i, Config::TESTDB_BUCKET_DB_PERSISTENT);
+            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
+            cfg.GENESIS_TEST_ACCOUNT_COUNT = 200;
+            return cfg;
+        });
+    simulation->startAllNodes();
+    auto const closeTime = simulation->getExpectedLedgerCloseTime();
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(8, 0); }, 30 * closeTime,
+        false);
+
+    std::vector<std::pair<SecretKey, Config>> nodes;
+    for (auto const& id : simulation->getNodeIDs())
+    {
+        auto cfg = simulation->getNode(id)->getConfig();
+        cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH = depth;
+        nodes.emplace_back(cfg.NODE_SEED, cfg);
+    }
+    for (auto const& [key, cfg] : nodes)
+    {
+        simulation->removeNode(key.getPublicKey());
+    }
+    for (auto& [key, cfg] : nodes)
+    {
+        simulation->addNode(key, cfg.QUORUM_SET, &cfg, false);
+    }
+    for (auto const& app : simulation->getNodes())
+    {
+        app->start();
+    }
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        for (size_t j = i + 1; j < nodes.size(); ++j)
+        {
+            simulation->addConnection(nodes[i].first.getPublicKey(),
+                                      nodes[j].first.getPublicKey());
+        }
+    }
+    auto const switched =
+        simulation->getNodes()[0]->getLedgerManager().getLastClosedLedgerNum();
+    for (auto const& app : simulation->getNodes())
+    {
+        REQUIRE(app->getLedgerManager().getPipelineStartLedger() == switched);
+    }
+
+    auto& app = *simulation->getNodes()[0];
+    auto& done =
+        app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
+    auto const before = done.count();
+    app.getLoadGenerator().generateLoad(GeneratedLoadConfig::txLoad(
+        LoadGenMode::PAY, 200, /* nTxs */ 200, /* txRate */ 10));
+    simulation->crankUntil([&]() { return done.count() > before; },
+                           200 * closeTime, false);
+    REQUIRE(done.count() > before);
+    REQUIRE(app.getMetrics()
+                .NewMeter({"loadgen", "run", "failed"}, "run")
+                .count() == 0);
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(switched + 10, 1); },
+        30 * closeTime, false);
+    REQUIRE(simulation->haveAllExternalized(switched + 10, 1));
+}

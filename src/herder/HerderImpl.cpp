@@ -56,6 +56,27 @@ using namespace std;
 namespace stellar
 {
 
+// Live pipelining: with k slots open, each slot can use 1/k of the queued
+// transactions, so the queues are k times larger; and a transaction may wait
+// up to about 2k ledgers for a slot of its class, so it is kept k times as
+// many ledgers before it times out.
+static uint32_t
+pipelineQueueFactor(Config const& cfg)
+{
+    return cfg.livePipelining() ? cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH : 1;
+}
+
+// Live pipelining log lines (PipelineLive here, PipelineApply in
+// LedgerManagerImpl): times on the steady clock, so they compare across nodes
+// that run on one host.
+static int64_t
+pipelineLogNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // Roughly ~10 minutes of consensus
 constexpr uint32 const CLOSE_TIME_DRIFT_LEDGER_WINDOW_SIZE = 120;
 // 10 seconds of drift threshold
@@ -89,15 +110,19 @@ HerderImpl::SCPMetrics::SCPMetrics(Application& app)
 }
 
 HerderImpl::HerderImpl(Application& app)
-    : mTransactionQueue(app, TRANSACTION_QUEUE_TIMEOUT_LEDGERS,
+    : mTransactionQueue(app,
+                        TRANSACTION_QUEUE_TIMEOUT_LEDGERS *
+                            pipelineQueueFactor(app.getConfig()),
                         TRANSACTION_QUEUE_BAN_LEDGERS,
-                        app.getConfig().TRANSACTION_QUEUE_SIZE_MULTIPLIER)
+                        app.getConfig().TRANSACTION_QUEUE_SIZE_MULTIPLIER *
+                            pipelineQueueFactor(app.getConfig()))
     , mPendingEnvelopes(app, *this)
     , mHerderSCPDriver(app, *this, mUpgrades, mPendingEnvelopes)
     , mLastSlotSaved(0)
     , mTrackingTimer(app)
     , mLastExternalize(app.getClock().now())
     , mTriggerTimer(app)
+    , mPipelineTimer(app)
     , mOutOfSyncTimer(app)
     , mTxSetGarbageCollectTimer(app)
     , mCheckForDeadNodesTimer(app)
@@ -381,6 +406,45 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
     LedgerCloseData ledgerData(static_cast<uint32_t>(slotIndex),
                                externalizedSet, value);
 
+    if (mApp.getConfig().EXPERIMENTAL_TEST_TX_LATENCY && isLatestSlot)
+    {
+        // Latency from first receipt to externalize.
+        auto const now = pipelineLogNs();
+        std::string lat;
+        size_t n = 0;
+        for (auto const& phase :
+             externalizedSet->createTransactionFrames(mApp.getNetworkID()))
+        {
+            for (auto const& tx : phase)
+            {
+                auto it = mTestTxSeen.find(tx->getFullHash());
+                if (it != mTestTxSeen.end())
+                {
+                    lat += fmt::format("{}{}", n++ ? "," : "",
+                                       (now - it->second) / 1000000);
+                    mTestTxSeen.erase(it);
+                }
+            }
+        }
+        if (slotIndex % 64 == 0)
+        {
+            // Forget transactions seen more than two minutes ago.
+            for (auto it = mTestTxSeen.begin(); it != mTestTxSeen.end();)
+            {
+                it = now - it->second > 120000000000LL ? mTestTxSeen.erase(it)
+                                                       : std::next(it);
+            }
+        }
+        CLOG_INFO(Herder, "PipelineLive event=txlat ledger={} n={} ms={}",
+                  slotIndex, n, lat);
+    }
+
+    if (mApp.getConfig().livePipelining() && isLatestSlot)
+    {
+        mPipelineExternalizedLedger = static_cast<uint32_t>(slotIndex);
+        mPipelineExternalizedValue = value;
+    }
+
     // Only dump the most recent externalized tx set. Ledger sequence on a
     // written tx set shall only strictly move forward; it may have gaps with
     // the emitted debug meta, if the network is ahead of the local node
@@ -480,6 +544,9 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value,
 {
     ZoneScoped;
     int const DUMP_SCP_TIMEOUT_SECONDS = 20;
+    CLOG_INFO(Herder,
+              "PipelineLive event=externalize ledger={} latest={} t_ns={}",
+              slotIndex, isLatestSlot, pipelineLogNs());
 
     recordExternalizeAndCheckCloseTimeDrift(slotIndex, value,
                                             mDriftCTSlidingWindow);
@@ -707,6 +774,11 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf
             txNOT_SUPPORTED);
     }
 
+    if (result.code == TransactionQueue::AddResultCode::ADD_STATUS_PENDING &&
+        mApp.getConfig().EXPERIMENTAL_TEST_TX_LATENCY)
+    {
+        mTestTxSeen.emplace(tx->getFullHash(), pipelineLogNs());
+    }
     if (result.code == TransactionQueue::AddResultCode::ADD_STATUS_PENDING)
     {
         CLOG_TRACE(Herder, "recv transaction {} for {}",
@@ -1127,6 +1199,16 @@ HerderImpl::processSCPQueue(bool synchronous)
                 std::min(nextIndex,
                          mApp.getLedgerManager().getLastClosedLedgerNum() + 1);
         }
+        if (mApp.getConfig().livePipelining())
+        {
+            // Slots up to LCL+k can be validated: the value of N is built on
+            // N-k, which is the LCL or an earlier ledger.
+            auto const depth =
+                mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+            nextIndex = std::min<uint64>(
+                trackingConsensusLedgerIndex() + depth,
+                mApp.getLedgerManager().getLastClosedLedgerNum() + depth);
+        }
         auto processSCPQueueSomeMore = [this, nextIndex] {
             if (mApp.isStopping())
             {
@@ -1271,7 +1353,20 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
                       mLedgerManager.getLastClosedLedgerNum());
         releaseAssert(mLedgerManager.isSynced());
 
-        setupTriggerNextLedger();
+        if (!mApp.getConfig().livePipelining())
+        {
+            setupTriggerNextLedger();
+        }
+        else if (mPipelineWaitingLedger != 0)
+        {
+            // A slot was waiting for this ledger as its base.
+            pipelineFire(mPipelineWaitingLedger);
+        }
+        else if (mPipelineScheduledLedger <= trackingConsensusLedgerIndex())
+        {
+            // No pipelined slot ahead: start (or restart) the chain.
+            setupTriggerNextLedger();
+        }
 
         // Now that the new ledger is closed, process any already-buffered SCP
         // envelopes for the next slot. Posted to the main thread so control
@@ -1279,6 +1374,12 @@ HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet,
         // externalize time, so that SCP state doesn't accumulate while the
         // node is applying or catching up.
         processSCPQueue(false);
+    }
+    else if (mApp.getConfig().livePipelining() && mPipelineWaitingLedger != 0)
+    {
+        // A slot waiting for its base N-k may be free now, while later slots
+        // are still to be applied: check it without waiting for them.
+        pipelineFire(mPipelineWaitingLedger);
     }
 }
 
@@ -1420,7 +1521,8 @@ HerderImpl::triggerAnchorFromConsensusCloseTime(
 
     // Scenario 1: if elapsed system time exceeds target plus explainable
     // nomination delay, treat it as clock-ahead drift and use the fallback.
-    if (timeSinceNetworkLedgerStart > expectedClose + nominationBudget)
+    if (timeSinceNetworkLedgerStart > expectedClose + nominationBudget &&
+        !mApp.getConfig().EXPERIMENTAL_TRIGGER_NO_DRIFT_FALLBACK)
     {
         return fallbackToPrepareStart();
     }
@@ -1433,14 +1535,19 @@ HerderImpl::setupTriggerNextLedger()
 {
     // Invariant: core proceeds to vote for the next ledger only when it's _not_
     // applying to ensure block production does not conflict with ledger close.
-    releaseAssert(!mLedgerManager.isApplying());
+    // With live pipelining it does vote while applying: values are built on
+    // N-k and validated against its (immutable) state.
+    bool const pipeline = mApp.getConfig().livePipelining();
+    releaseAssert(!mLedgerManager.isApplying() || pipeline);
 
-    // Invariant: tracking is equal to LCL when we trigger. This helps ensure
-    // core emits SCP messages only for slots it can fully validate
-    // (any closed ledger is fully validated)
+    // Invariant: tracking is equal to LCL when we trigger (or LCL+1 with live
+    // pipelining). This helps ensure core emits SCP messages only for slots it
+    // can fully validate (any closed ledger is fully validated)
     releaseAssert(isTracking());
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-    releaseAssert(trackingConsensusLedgerIndex() == lcl.header.ledgerSeq);
+    releaseAssert(trackingConsensusLedgerIndex() == lcl.header.ledgerSeq ||
+                  (pipeline &&
+                   trackingConsensusLedgerIndex() == lcl.header.ledgerSeq + 1));
     releaseAssert(mLedgerManager.isSynced());
 
     mTriggerTimer.cancel();
@@ -1484,8 +1591,9 @@ HerderImpl::setupTriggerNextLedger()
         triggerTime - now);
 
     // The smallest close time the next nomination may propose
-    auto minCandidateCt =
-        getConsensusTime(lcl.header.scpValue).next(lcl.header.ledgerVersion);
+    auto minCandidateCt = (pipeline ? trackingConsensusCloseTime()
+                                    : getConsensusTime(lcl.header.scpValue))
+                              .next(lcl.header.ledgerVersion);
     auto ctOffset = ctValidityOffset(minCandidateCt, triggerOffset);
 
     if (ctOffset > std::chrono::milliseconds::zero())
@@ -1498,6 +1606,12 @@ HerderImpl::setupTriggerNextLedger()
     // time as reference point for triggering again (this may trigger right
     // away if externalizing took a long time)
     mTriggerTimer.expires_at(triggerTime);
+    CLOG_INFO(
+        Herder, "PipelineLive event=armed ledger={} delay_ms={} t_ns={}",
+        nextIndex,
+        std::chrono::duration_cast<std::chrono::milliseconds>(triggerTime - now)
+            .count(),
+        pipelineLogNs());
 
     if (!mApp.getConfig().MANUAL_CLOSE)
     {
@@ -1665,7 +1779,8 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     }
 
     // If applying, the next ledger will trigger voting
-    if (mLedgerManager.isApplying())
+    bool const pipeline = mApp.getConfig().livePipelining();
+    if (mLedgerManager.isApplying() && !pipeline)
     {
         // This can only happen when closing ledgers in parallel
         releaseAssert(mApp.getConfig().backgroundLedgerApply());
@@ -1674,10 +1789,14 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         return;
     }
 
+    CLOG_INFO(Herder, "PipelineLive event=trigger ledger={} t_ns={}",
+              ledgerSeqToTrigger, pipelineLogNs());
+
     // our first choice for this round's set is all the tx we have collected
     // during last few ledger closes
     // Since we are not currently applying, it is safe to use read-only LCL, as
-    // it's guaranteed to be up-to-date
+    // it's guaranteed to be up-to-date. With live pipelining a later ledger
+    // may be applying; the tx set is then built on N-k (see below).
     auto lcl = mLedgerManager.getLastClosedLedgerHeader();
     auto const txSetBuildStart = std::chrono::steady_clock::now();
     PerPhaseTransactionList txPhases;
@@ -1689,6 +1808,26 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         releaseAssert(mSorobanTransactionQueue);
         txPhases.emplace_back(
             mSorobanTransactionQueue->getTransactions(lcl.header));
+    }
+
+    // Live pipelining: a `pipelined` slot is nominated before the ledger
+    // before it has applied. The k slots in consensus together take
+    // transactions from disjoint fee payers.
+    bool const pipelined =
+        pipeline && ledgerSeqToTrigger >= lcl.header.ledgerSeq + 2;
+    uint32_t const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    if (pipeline)
+    {
+        for (auto& phase : txPhases)
+        {
+            phase.erase(
+                std::remove_if(phase.begin(), phase.end(),
+                               [ledgerSeqToTrigger, depth](auto const& tx) {
+                                   return !pipelineTxInSlot(
+                                       *tx, ledgerSeqToTrigger, depth);
+                               }),
+                phase.end());
+        }
     }
 
     // We pick as next close time the current time unless it's before the last
@@ -1719,7 +1858,10 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         }
     }
 
-    auto const lclCloseTime = getConsensusTime(lcl.header.scpValue);
+    auto const lclCloseTime =
+        pipeline && mPipelineExternalizedLedger > lcl.header.ledgerSeq
+            ? getConsensusTime(mPipelineExternalizedValue)
+            : getConsensusTime(lcl.header.scpValue);
     if (nextCloseTime <= lclCloseTime)
     {
         nextCloseTime = lclCloseTime.next(lcl.header.ledgerVersion);
@@ -1749,14 +1891,48 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     // close times the next ledger may therefore apply in the same second as the
     // LCL (a zero offset), and a transaction whose time bounds are met at that
     // second is valid in both ledgers.
+    //
+    // Live pipelining: the transactions are validated against N-k, as other
+    // validators will, so the offset is from N-k's close time. A node that
+    // doesn't keep N-k's state (after a restart) doesn't propose yet.
+    uint32_t const baseSeq =
+        pipeline ? pipelineBaseLedger(ledgerSeqToTrigger, depth,
+                                      mLedgerManager.getPipelineStartLedger())
+                 : 0;
+    auto const base = pipeline ? mLedgerManager.getRecentLedgerHeader(baseSeq)
+                               : std::make_optional(lcl);
+    if (!base)
+    {
+        CLOG_WARNING(Herder, "Pipeline base ledger {} not kept, skipping",
+                     baseSeq);
+        return;
+    }
     auto const closeTimeOffset =
-        nextCloseTime.toApplyTime() - getApplyTime(lcl.header.scpValue);
+        nextCloseTime.toApplyTime() - getApplyTime(base->header.scpValue);
 
     PerPhaseTransactionList invalidTxPhases;
     invalidTxPhases.resize(txPhases.size());
 
+    std::optional<PipelineValidationBase> validationBase;
+    if (pipeline && baseSeq < lcl.header.ledgerSeq)
+    {
+        validationBase.emplace(mLedgerManager, baseSeq);
+    }
     auto [proposedSet, applicableProposedSet] = makeTxSetFromTransactions(
         txPhases, mApp, closeTimeOffset, invalidTxPhases);
+    validationBase.reset();
+
+    if (pipeline && baseSeq < lcl.header.ledgerSeq)
+    {
+        // The value of N is built on exactly N-k, so every validator
+        // that may vote on N (its LCL is N-k or later) can check it.
+        GeneralizedTransactionSet xdrSet;
+        proposedSet->toXDR(xdrSet);
+        xdrSet.v1TxSet().previousLedgerHash = base->hash;
+        proposedSet = TxSetXDRFrame::makeFromWire(xdrSet);
+        applicableProposedSet = proposedSet->prepareForApply(mApp, lcl.header);
+        releaseAssert(applicableProposedSet);
+    }
 
     // New proposed tx set must be valid, so we explicitly populate tx set
     // validity cache so SCP can reuse the result.
@@ -1795,19 +1971,27 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     // Inform the item fetcher so queries from other peers about his txSet
     // can be answered. Note this can trigger SCP callbacks, externalize, etc
     // if we happen to build a txset that we were trying to download.
-    mPendingEnvelopes.addTxSet(txSetHash, lcl.header.ledgerSeq + 1,
-                               proposedSet);
+    mPendingEnvelopes.addTxSet(
+        txSetHash, pipelined ? ledgerSeqToTrigger : lcl.header.ledgerSeq + 1,
+        proposedSet);
 
     lcl = mLedgerManager.getLastClosedLedgerHeader();
     // use the slot index from ledger manager here as our vote is based off
     // the last closed ledger stored in ledger manager
-    uint32_t slotIndex = lcl.header.ledgerSeq + 1;
+    uint32_t slotIndex =
+        pipelined ? ledgerSeqToTrigger : lcl.header.ledgerSeq + 1;
+    if (pipeline && ledgerSeqToTrigger <= trackingConsensusLedgerIndex())
+    {
+        // Externalized while we were building
+        return;
+    }
 
     // no point in sending out a prepare:
     // externalize was triggered on a more recent ledger
     // Also skip trigger if side effects from `addTxSet` caused us to start
     // applying
-    if (ledgerSeqToTrigger != slotIndex || mLedgerManager.isApplying())
+    if (ledgerSeqToTrigger != slotIndex ||
+        (mLedgerManager.isApplying() && !pipeline))
     {
         return;
     }
@@ -1820,6 +2004,12 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         auto ledgerView = mApp.getLedgerManager().getLCLView();
         upgrades = mUpgrades.createUpgradesFor(lcl.header, *ledgerView,
                                                mApp.getConfig());
+    }
+    if (pipeline && slotIndex % depth != 0)
+    {
+        // Only one ledger in k may carry upgrades, so two slots in consensus
+        // never carry the same one.
+        upgrades.clear();
     }
     for (auto const& upgrade : upgrades)
     {
@@ -1862,8 +2052,75 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
 
     StellarValue newProposedValue = makeStellarValue(
         txSetHash, nextCloseTime, newUpgrades, mApp.getConfig().NODE_SEED);
+    // Leader election for N uses the value of the ledger it is built on
+    // (with live pipelining N-k, as applied: every node that can nominate N
+    // has it).
     mHerderSCPDriver.nominate(slotIndex, newProposedValue, proposedSet,
-                              lcl.header.scpValue);
+                              base->header.scpValue);
+    if (pipeline)
+    {
+        // The next slot starts one target close time after this one,
+        // without waiting for this one to externalize.
+        pipelineSchedule(slotIndex + 1,
+                         mApp.getClock().now() +
+                             mLedgerManager.getExpectedLedgerCloseTime());
+    }
+}
+
+bool
+pipelineAccountInSlot(AccountID const& account, uint64_t ledgerSeq,
+                      uint32_t depth)
+{
+    return account.ed25519()[0] % depth == ledgerSeq % depth;
+}
+
+bool
+pipelineTxInSlot(TransactionFrameBase const& tx, uint64_t ledgerSeq,
+                 uint32_t depth)
+{
+    return pipelineAccountInSlot(tx.getFeeSourceID(), ledgerSeq, depth);
+}
+
+uint32_t
+pipelineBaseLedger(uint64_t ledgerSeq, uint32_t depth, uint32_t startLedger)
+{
+    return ledgerSeq >= static_cast<uint64_t>(startLedger) + depth
+               ? static_cast<uint32_t>(ledgerSeq - depth)
+               : startLedger;
+}
+
+void
+HerderImpl::pipelineSchedule(uint32_t ledgerSeq, VirtualClock::time_point when)
+{
+    mPipelineScheduledLedger = ledgerSeq;
+    mPipelineTimer.expires_at(when);
+    CLOG_INFO(Herder, "PipelineLive event=armed ledger={} delay_ms={} t_ns={}",
+              ledgerSeq,
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  when - mApp.getClock().now())
+                  .count(),
+              pipelineLogNs());
+    mPipelineTimer.async_wait([this, ledgerSeq]() { pipelineFire(ledgerSeq); },
+                              &VirtualTimer::onFailureNoop);
+}
+
+void
+HerderImpl::pipelineFire(uint32_t ledgerSeq)
+{
+    mPipelineWaitingLedger = 0;
+    if (!isTracking() || !mLedgerManager.isSynced())
+    {
+        return;
+    }
+    ledgerSeq = std::max(ledgerSeq, nextConsensusLedgerIndex());
+    if (ledgerSeq > mLedgerManager.getLastClosedLedgerNum() +
+                        mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH)
+    {
+        // The value must be built on N-k at the oldest: wait for it to apply.
+        mPipelineWaitingLedger = ledgerSeq;
+        return;
+    }
+    triggerNextLedger(ledgerSeq, true);
 }
 
 void
@@ -2576,9 +2833,12 @@ HerderImpl::maybeSetupSorobanQueue(uint32_t protocolVersion)
         {
             mSorobanTransactionQueue =
                 std::make_unique<SorobanTransactionQueue>(
-                    mApp, TRANSACTION_QUEUE_TIMEOUT_LEDGERS,
+                    mApp,
+                    TRANSACTION_QUEUE_TIMEOUT_LEDGERS *
+                        pipelineQueueFactor(mApp.getConfig()),
                     TRANSACTION_QUEUE_BAN_LEDGERS,
-                    mApp.getConfig().SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER,
+                    mApp.getConfig().SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER *
+                        pipelineQueueFactor(mApp.getConfig()),
                     recomputeKeysToFilter(protocolVersion));
         }
     }

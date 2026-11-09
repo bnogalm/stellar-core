@@ -175,6 +175,12 @@ Config::Config() : NODE_SEED(SecretKey::random())
     BACKGROUND_OVERLAY_PROCESSING = true;
     PARALLEL_LEDGER_APPLY = true;
     EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = false;
+    EXPERIMENTAL_LIVE_PIPELINE_DEPTH = 1;
+    EXPERIMENTAL_NOMINATION_LEADERS = 1;
+    EXPERIMENTAL_NOMINATION_TIMEOUT_MS = 0;
+    EXPERIMENTAL_TRIGGER_NO_DRIFT_FALLBACK = false;
+    EXPERIMENTAL_TEST_DOS_TOP_LEADER = false;
+    EXPERIMENTAL_TEST_TX_LATENCY = false;
     DISABLE_SOROBAN_METRICS_FOR_TESTING = false;
     DISABLE_TX_META_FOR_TESTING = false;
     BACKGROUND_TX_SIG_VERIFICATION = true;
@@ -1212,6 +1218,29 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() {
                      EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD = readBool(item);
                  }},
+                {"EXPERIMENTAL_LIVE_PIPELINE_DEPTH",
+                 [&]() {
+                     EXPERIMENTAL_LIVE_PIPELINE_DEPTH =
+                         readInt<uint32_t>(item, 1, 16);
+                 }},
+                {"EXPERIMENTAL_NOMINATION_LEADERS",
+                 [&]() {
+                     EXPERIMENTAL_NOMINATION_LEADERS =
+                         readInt<uint32_t>(item, 1, 8);
+                 }},
+                {"EXPERIMENTAL_NOMINATION_TIMEOUT_MS",
+                 [&]() {
+                     EXPERIMENTAL_NOMINATION_TIMEOUT_MS =
+                         readInt<uint32_t>(item, 0, 10000);
+                 }},
+                {"EXPERIMENTAL_TRIGGER_NO_DRIFT_FALLBACK",
+                 [&]() {
+                     EXPERIMENTAL_TRIGGER_NO_DRIFT_FALLBACK = readBool(item);
+                 }},
+                {"EXPERIMENTAL_TEST_DOS_TOP_LEADER",
+                 [&]() { EXPERIMENTAL_TEST_DOS_TOP_LEADER = readBool(item); }},
+                {"EXPERIMENTAL_TEST_TX_LATENCY",
+                 [&]() { EXPERIMENTAL_TEST_TX_LATENCY = readBool(item); }},
                 {"DISABLE_SOROBAN_METRICS_FOR_TESTING",
                  [&]() {
                      DISABLE_SOROBAN_METRICS_FOR_TESTING = readBool(item);
@@ -2644,6 +2673,12 @@ bool
 Config::backgroundLedgerApply() const
 {
     return PARALLEL_LEDGER_APPLY && DATABASE.value != "sqlite3://:memory:";
+}
+
+bool
+Config::livePipelining() const
+{
+    return EXPERIMENTAL_LIVE_PIPELINE_DEPTH > 1;
 }
 
 bool

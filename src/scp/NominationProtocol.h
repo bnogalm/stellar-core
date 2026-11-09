@@ -20,6 +20,9 @@ class NominationProtocol
     Slot& mSlot;
 
     int32 mRoundNumber;
+    // Testing (simulated DoS on the top leader): the node held back its
+    // nomination in round 1 and must send it in the next round.
+    bool mSilencedForTesting{false};
 
     ValueWrapperPtrSet mVotes;                                  // X
     ValueWrapperPtrSet mAccepted;                               // Y

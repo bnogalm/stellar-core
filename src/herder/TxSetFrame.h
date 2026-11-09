@@ -169,6 +169,18 @@ makeTxSetFromTransactions(
     bool disableTxValidationForLegacyScenario = false);
 #endif
 
+// Whether a tx set built on `previousLedgerHash` may be applied on top of
+// `lcl`: the LCL itself, or with live pipelining (depth k) also one of its
+// ancestors up to k - 1 ledgers back.
+bool txSetBuildsOn(Application& app, Hash const& previousLedgerHash,
+                   LedgerHeaderHistoryEntry const& lcl);
+
+// The ledger number of `hash` if it is the LCL or one of the ancestors the
+// pipeline keeps (up to `maxBack` ledgers back).
+std::optional<uint32_t> recentLedgerSeqOf(Application& app, Hash const& hash,
+                                          LedgerHeaderHistoryEntry const& lcl,
+                                          uint32_t maxBack);
+
 // `TxSetFrame` is a wrapper around `TransactionSet` or
 // `GeneralizedTransactionSet` XDR.
 //

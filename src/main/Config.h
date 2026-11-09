@@ -535,6 +535,34 @@ class Config : public std::enable_shared_from_this<Config>
     // Allow downloading of transaction sets in parallel with SCP (experimental)
     bool EXPERIMENTAL_PARALLEL_TX_SET_DOWNLOAD;
 
+    // Live pipelining: ledgers in consensus at once (1 to 16, 1 is off). See
+    // docs/stellar-core_example.cfg. Use livePipelining() to test it.
+    uint32_t EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+
+    // Nomination leaders per round (default 1). With more, a round goes on
+    // when one leader is unavailable, so a DoS aimed at the predicted leaders
+    // has to take all of them down at once.
+    uint32_t EXPERIMENTAL_NOMINATION_LEADERS;
+
+    // Nomination timeout (initial and increment, ms) instead of the network
+    // setting; 0 keeps the network setting.
+    uint32_t EXPERIMENTAL_NOMINATION_TIMEOUT_MS;
+
+    // Anchor the trigger timer on the externalized close time even when
+    // consensus took longer than the target, instead of treating that as
+    // clock drift. Needed for targets shorter than consensus; only safe when
+    // validator clocks agree.
+    bool EXPERIMENTAL_TRIGGER_NO_DRIFT_FALLBACK;
+
+    // Testing only: a validator stays silent in the first nomination round of
+    // every slot where it has the top priority, as if a DoS aimed at the
+    // predicted leader took it down for that round.
+    bool EXPERIMENTAL_TEST_DOS_TOP_LEADER;
+
+    // Testing only: log, for every externalized ledger, the time since this
+    // node first received each of its transactions.
+    bool EXPERIMENTAL_TEST_TX_LATENCY;
+
     // Disable expensive Soroban metrics for performance testing
     bool DISABLE_SOROBAN_METRICS_FOR_TESTING;
 
@@ -1009,6 +1037,8 @@ class Config : public std::enable_shared_from_this<Config>
     // set (in-memory SQLite doesn't support it; a warning is logged and the
     // flag is cleared during config validation).
     bool backgroundLedgerApply() const;
+    // EXPERIMENTAL_LIVE_PIPELINE_DEPTH is 2 or more
+    bool livePipelining() const;
 
     // Returns true if this node should run the NTP clock-drift check: an NTP
     // server is configured and the node is a validator (clock drift only hurts

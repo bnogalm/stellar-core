@@ -147,6 +147,29 @@ void
 NominationProtocol::emitNomination()
 {
     ZoneScoped;
+    if (mRoundNumber == 1 && mSlot.getSCPDriver().simulateDosOnTopLeader())
+    {
+        // Testing: silent while the predicted top leader of round 1.
+        SCPQuorumSet myQSet = mSlot.getLocalNode()->getQuorumSet();
+        auto localID = mSlot.getLocalNode()->getNodeID();
+        normalizeQSet(myQSet, &localID);
+        uint64 const mine = getNodePriority(localID, myQSet);
+        bool top = mine > 0;
+        LocalNode::forAllNodes(myQSet, [&](NodeID const& cur) {
+            if (getNodePriority(cur, myQSet) >= mine)
+            {
+                top = false;
+            }
+            return true;
+        });
+        if (top)
+        {
+            // Remember it, so the state is sent once the round is over, as
+            // a validator whose messages were lost would rebroadcast them.
+            mSilencedForTesting = true;
+            return;
+        }
+    }
     SCPStatement st;
     st.nodeID = mSlot.getLocalNode()->getNodeID();
     st.pledges.type(SCP_ST_NOMINATE);
@@ -264,6 +287,29 @@ NominationProtocol::updateRoundLeaders()
             }
             return true;
         });
+
+        // With more than one leader per round, take the nodes with the
+        // highest priorities (every node computes the same ones).
+        size_t const leaders = mSlot.getSCPDriver().getNominationLeaderCount();
+        if (leaders > 1 && topPriority > 0)
+        {
+            std::vector<std::pair<uint64, NodeID>> ranked;
+            ranked.emplace_back(getNodePriority(localID, myQSet), localID);
+            LocalNode::forAllNodes(myQSet, [&](NodeID const& cur) {
+                ranked.emplace_back(getNodePriority(cur, myQSet), cur);
+                return true;
+            });
+            std::sort(
+                ranked.begin(), ranked.end(),
+                [](auto const& a, auto const& b) { return a.first > b.first; });
+            for (size_t i = 0; i < ranked.size() && i < leaders; ++i)
+            {
+                if (ranked[i].first > 0)
+                {
+                    newRoundLeaders.insert(ranked[i].second);
+                }
+            }
+        }
 
         if (topPriority == 0)
         {
@@ -590,6 +636,11 @@ NominationProtocol::nominate(ValueWrapperPtr value, Value const& previousValue,
 
     mRoundNumber++;
     updateRoundLeaders();
+    if (mSilencedForTesting && mRoundNumber > 1)
+    {
+        mSilencedForTesting = false;
+        updated = true;
+    }
 
     std::chrono::milliseconds timeout = mSlot.getSCPDriver().computeTimeout(
         mRoundNumber, /*isNomination=*/true);

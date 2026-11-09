@@ -498,7 +498,11 @@ createSurgePricingLangeConfig(TxSetPhase phase, Application& app)
 {
     ZoneScoped;
     releaseAssert(threadIsMain());
-    releaseAssert(!app.getLedgerManager().isApplying());
+    // With live pipelining tx sets are built and validated while a ledger
+    // applies; they only read the LCL header and the snapshot of the LCL or
+    // of N-k (see PipelineValidationBase).
+    releaseAssert(!app.getLedgerManager().isApplying() ||
+                  app.getConfig().livePipelining());
 
     auto const& lclHeader =
         app.getLedgerManager().getLastClosedLedgerHeader().header;
@@ -846,7 +850,11 @@ makeTxSetFromTransactions(
 )
 {
     releaseAssert(threadIsMain());
-    releaseAssert(!app.getLedgerManager().isApplying());
+    // With live pipelining tx sets are built and validated while a ledger
+    // applies; they only read the LCL header and the snapshot of the LCL or
+    // of N-k (see PipelineValidationBase).
+    releaseAssert(!app.getLedgerManager().isApplying() ||
+                  app.getConfig().livePipelining());
     releaseAssert(txPhases.size() == invalidTxs.size());
     releaseAssert(txPhases.size() <=
                   static_cast<size_t>(TxSetPhase::PHASE_COUNT));
@@ -1059,7 +1067,11 @@ makeTxSetFromTransactions(
     bool disableTxValidationForLegacyScenario)
 {
     releaseAssert(threadIsMain());
-    releaseAssert(!app.getLedgerManager().isApplying());
+    // With live pipelining tx sets are built and validated while a ledger
+    // applies; they only read the LCL header and the snapshot of the LCL or
+    // of N-k (see PipelineValidationBase).
+    releaseAssert(!app.getLedgerManager().isApplying() ||
+                  app.getConfig().livePipelining());
     auto lclHeader = app.getLedgerManager().getLastClosedLedgerHeader();
     PerPhaseTransactionList perPhaseTxs;
     perPhaseTxs.resize(protocolVersionStartsFrom(lclHeader.header.ledgerVersion,
@@ -2061,8 +2073,9 @@ ApplicableTxSetFrame::ApplicableTxSetFrame(
     // closeLedger already
     if (threadIsMain())
     {
-        releaseAssert(previousLedgerHash ==
-                      app.getLedgerManager().getLastClosedLedgerHeader().hash);
+        releaseAssert(
+            txSetBuildsOn(app, previousLedgerHash,
+                          app.getLedgerManager().getLastClosedLedgerHeader()));
     }
 }
 
@@ -2149,6 +2162,53 @@ ApplicableTxSetFrame::checkValidInternal(Application& app,
                txsAreValidated) == TxSetValidationResult::VALID;
 }
 
+std::optional<uint32_t>
+recentLedgerSeqOf(Application& app, Hash const& hash,
+                  LedgerHeaderHistoryEntry const& lcl, uint32_t maxBack)
+{
+    for (uint32_t back = 0; back <= maxBack && back < lcl.header.ledgerSeq;
+         ++back)
+    {
+        uint32_t const seq = lcl.header.ledgerSeq - back;
+        std::optional<Hash> h;
+        if (back == 0)
+        {
+            h = lcl.hash;
+        }
+        else if (back == 1)
+        {
+            h = lcl.header.previousLedgerHash;
+        }
+        else
+        {
+            h = app.getLedgerManager().getRecentLedgerHash(seq);
+        }
+        if (h && *h == hash)
+        {
+            return seq;
+        }
+    }
+    return std::nullopt;
+}
+
+bool
+txSetBuildsOn(Application& app, Hash const& previousLedgerHash,
+              LedgerHeaderHistoryEntry const& lcl)
+{
+    if (previousLedgerHash == lcl.hash)
+    {
+        return true;
+    }
+    auto const& cfg = app.getConfig();
+    if (!cfg.livePipelining())
+    {
+        return false;
+    }
+    return recentLedgerSeqOf(app, previousLedgerHash, lcl,
+                             cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH - 1)
+        .has_value();
+}
+
 TxSetValidationResult
 ApplicableTxSetFrame::checkValidInternalWithResult(
     Application& app, uint64_t lowerBoundCloseTimeOffset,
@@ -2159,7 +2219,7 @@ ApplicableTxSetFrame::checkValidInternalWithResult(
     auto const& lcl = app.getLedgerManager().getLastClosedLedgerHeader();
 
     // Start by checking previousLedgerHash
-    if (lcl.hash != mPreviousLedgerHash)
+    if (!txSetBuildsOn(app, mPreviousLedgerHash, lcl))
     {
         CLOG_DEBUG(Herder, "Got bad txSet: {}, expected {}",
                    hexAbbrev(mPreviousLedgerHash), hexAbbrev(lcl.hash));

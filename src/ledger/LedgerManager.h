@@ -178,6 +178,18 @@ class InMemorySorobanState;
 //     committed and immutable, but not yet adopted as LCL. It is handed off by
 //     value from the apply thread to the main thread, which adopts it in
 //     completeLedgerClose.
+class LedgerManager;
+
+// Live pipelining: validate against a recent ledger within a scope.
+class PipelineValidationBase
+{
+    LedgerManager& mLedgerManager;
+
+  public:
+    PipelineValidationBase(LedgerManager& lm, std::optional<uint32_t> seq);
+    ~PipelineValidationBase();
+};
+
 class LedgerManager
 {
 
@@ -298,6 +310,27 @@ class LedgerManager
 
     // Return the sequence number of the LCL.
     virtual uint32_t getLastClosedLedgerNum() const = 0;
+
+    // Live pipelining (main thread): header and hash of the LCL or of one of
+    // the last few ledgers before it, if kept (they are not after a restart).
+    virtual std::optional<LedgerHeaderHistoryEntry>
+    getRecentLedgerHeader(uint32_t ledgerSeq) const = 0;
+
+    // Live pipelining: the ledger where pipelining with the configured k
+    // started (the LCL when it was switched on). Values of the first k - 1
+    // ledgers after it are built on it, since no node keeps the states of
+    // the ledgers before it.
+    virtual uint32_t getPipelineStartLedger() const = 0;
+
+    // Live pipelining: hash of a recently applied ledger, if kept.
+    virtual std::optional<Hash>
+    getRecentLedgerHash(uint32_t ledgerSeq) const = 0;
+
+    // Live pipelining: while set (main thread), getLCLView returns the
+    // state of this recent ledger instead of the LCL, so a tx set built on
+    // N-k is validated against N-k on every node. Use PipelineValidationBase.
+    virtual void
+    setPipelineValidationBase(std::optional<uint32_t> ledgerSeq) = 0;
 
     // Return the minimum balance required to establish, in the current ledger,
     // a new ledger entry with `ownerCount` owned objects.  Derived from the

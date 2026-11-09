@@ -248,6 +248,18 @@ HerderSCPDriver::isEnvelopeReady(SCPEnvelope const& env) const
 }
 
 bool
+HerderSCPDriver::simulateDosOnTopLeader() const
+{
+    return mApp.getConfig().EXPERIMENTAL_TEST_DOS_TOP_LEADER;
+}
+
+size_t
+HerderSCPDriver::getNominationLeaderCount() const
+{
+    return mApp.getConfig().EXPERIMENTAL_NOMINATION_LEADERS;
+}
+
+bool
 HerderSCPDriver::protocolAllowsEmptyTxSetValues() const
 {
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
@@ -277,6 +289,20 @@ HerderSCPDriver::checkCloseTime(uint64_t slotIndex, ConsensusTime lastCloseTime,
 {
     auto const closeTime = getConsensusTime(b);
 
+    // Live pipelining: N is nominated before N-1 externalizes, so its close
+    // time only has to follow N-k, as applied (callers have checked that
+    // N-k's header is kept).
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    if (mApp.getConfig().livePipelining())
+    {
+        if (auto base = mLedgerManager.getRecentLedgerHeader(pipelineBaseLedger(
+                slotIndex, depth, mLedgerManager.getPipelineStartLedger())))
+        {
+            lastCloseTime = std::min(lastCloseTime,
+                                     getConsensusTime(base->header.scpValue));
+        }
+    }
+
     // Check closeTime (not too old)
     if (closeTime <= lastCloseTime)
     {
@@ -299,6 +325,58 @@ HerderSCPDriver::checkCloseTime(uint64_t slotIndex, ConsensusTime lastCloseTime,
         return false;
     }
     return true;
+}
+
+bool
+HerderSCPDriver::pipelineBaseValid(TxSetXDRFrame const& txSet,
+                                   uint64_t slotIndex,
+                                   LedgerHeaderHistoryEntry const& lcl) const
+{
+    // Live pipelining: the tx set of N must be built on exactly N-k.
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    auto const baseSeq =
+        recentLedgerSeqOf(mApp, txSet.previousLedgerHash(), lcl, depth);
+    return baseSeq && *baseSeq == pipelineBaseLedger(
+                                      slotIndex, depth,
+                                      mLedgerManager.getPipelineStartLedger());
+}
+
+bool
+HerderSCPDriver::pipelinePartitionValid(TxSetXDRFrame const& txSet,
+                                        uint64_t slotIndex) const
+{
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    auto const key = std::make_pair(txSet.getContentsHash(), slotIndex);
+    auto it = mPipelinePartitionCache.find(key);
+    if (it != mPipelinePartitionCache.end())
+    {
+        return it->second;
+    }
+    bool valid = true;
+    for (auto const& phase : txSet.createTransactionFrames(mApp.getNetworkID()))
+    {
+        for (auto const& tx : phase)
+        {
+            if (!pipelineTxInSlot(*tx, slotIndex, depth))
+            {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if (!valid)
+    {
+        CLOG_WARNING(Herder,
+                     "PipelineLive event=partition_violation ledger={} "
+                     "txset={}",
+                     slotIndex, hexAbbrev(txSet.getContentsHash()));
+    }
+    if (mPipelinePartitionCache.size() > 256)
+    {
+        mPipelinePartitionCache.clear();
+    }
+    mPipelinePartitionCache.emplace(key, valid);
+    return valid;
 }
 
 SCPDriver::ValidationLevel
@@ -416,13 +494,56 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
     // For past and future slots, perform partial validity checks, specifically
     // validate close time and network tracking ledger sequence.
     bool isCurrentLedger = slotIndex == lcl.header.ledgerSeq + 1;
+    // Live pipelining: LCL+2 to LCL+k are current too, since their values
+    // are built on N-k, which this node has applied.
+    bool const pipeline = mApp.getConfig().livePipelining();
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    bool isPipelinedLedger = pipeline &&
+                             slotIndex >= lcl.header.ledgerSeq + 2 &&
+                             slotIndex <= lcl.header.ledgerSeq + depth;
+    if (isPipelinedLedger && !isEmptyTxSetStellarValue(b))
+    {
+        // A tx set that is not built on N-k is checked as a past or future
+        // value instead.
+        auto const result = mPendingEnvelopes.getTxSet(b.txSetHash);
+        auto const* txSet = std::get_if<TxSetXDRFrameConstPtr>(&result);
+        if (txSet && *txSet)
+        {
+            auto const baseSeq = recentLedgerSeqOf(
+                mApp, (*txSet)->previousLedgerHash(), lcl, depth);
+            if (!baseSeq ||
+                *baseSeq !=
+                    pipelineBaseLedger(slotIndex, depth,
+                                       mLedgerManager.getPipelineStartLedger()))
+            {
+                isPipelinedLedger = false;
+            }
+        }
+    }
+
+    // Live pipelining: these values are validated against N-k. A node that
+    // doesn't keep N-k's state (after a restart) can't check them yet.
+    std::optional<LedgerHeaderHistoryEntry> base;
+    if (pipeline && (isCurrentLedger || isPipelinedLedger))
+    {
+        base = mLedgerManager.getRecentLedgerHeader(pipelineBaseLedger(
+            slotIndex, depth, mLedgerManager.getPipelineStartLedger()));
+        if (!base)
+        {
+            return SCPDriver::kMaybeValidNotCurrentValue;
+        }
+    }
 
     SCPDriver::ValidationLevel res;
-    if (isCurrentLedger)
+    if (isCurrentLedger || isPipelinedLedger)
     {
         // The value is for LCL+1, perform all possible checks
-        if (!checkCloseTime(slotIndex, getConsensusTime(lcl.header.scpValue),
-                            b))
+        auto const lastCloseTime =
+            isPipelinedLedger && mHerder.trackingConsensusLedgerIndex() >
+                                     lcl.header.ledgerSeq
+                ? mHerder.trackingConsensusCloseTime()
+                : getConsensusTime(lcl.header.scpValue);
+        if (!checkCloseTime(slotIndex, lastCloseTime, b))
         {
             return SCPDriver::kInvalidValue;
         }
@@ -447,7 +568,7 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
                            slotIndex);
                 return SCPDriver::kInvalidValue;
             }
-            if (getProposedPreviousLedgerHash(b) != lcl.hash ||
+            if (!txSetBuildsOn(mApp, getProposedPreviousLedgerHash(b), lcl) ||
                 getProposedPreviousLedgerVersion(b) != lcl.header.ledgerVersion)
             {
                 CLOG_DEBUG(Herder,
@@ -465,8 +586,14 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
         TxSetXDRFrameConstPtr txSet = std::get<TxSetXDRFrameConstPtr>(
             mPendingEnvelopes.getTxSet(txSetHash));
 
+        // Transactions are checked against the state of the ledger the value
+        // is built on (N-k with live pipelining), so the offset is from it.
+        auto const& offsetBase =
+            base ? base->header.scpValue : lcl.header.scpValue;
         auto closeTimeOffset =
-            getApplyTime(b) - getApplyTime(lcl.header.scpValue);
+            pipeline && getApplyTime(b) < getApplyTime(offsetBase)
+                ? ApplyTimeOffset{}
+                : getApplyTime(b) - getApplyTime(offsetBase);
 
         if (!txSet)
         {
@@ -488,7 +615,9 @@ HerderSCPDriver::validateValueAgainstLocalState(uint64_t slotIndex,
                 res = SCPDriver::kInvalidValue;
             }
         }
-        else if (!checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
+        else if ((pipeline && !pipelineBaseValid(*txSet, slotIndex, lcl)) ||
+                 (pipeline && !pipelinePartitionValid(*txSet, slotIndex)) ||
+                 !checkAndCacheTxSetValid(*txSet, lcl, closeTimeOffset))
         {
             CLOG_DEBUG(Herder,
                        "HerderSCPDriver::validateValue i: {} invalid txSet {}",
@@ -663,6 +792,17 @@ HerderSCPDriver::validateValue(uint64_t slotIndex, Value const& value,
         }
     }
 
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    if (res != SCPDriver::kInvalidValue && mApp.getConfig().livePipelining() &&
+        !b.upgrades.empty() && slotIndex % depth != 0)
+    {
+        // Live pipelining: upgrades only in ledgers that are a multiple of k;
+        // the k - 1 ledgers after one apply empty (LedgerManagerImpl).
+        CLOG_DEBUG(Herder, "validateValue i: {} upgrade outside its slot",
+                   slotIndex);
+        res = SCPDriver::kInvalidValue;
+    }
+
     if (res)
     {
         mSCPMetrics.mValueValid.Mark();
@@ -776,11 +916,18 @@ void
 HerderSCPDriver::timerCallbackWrapper(uint64_t slotIndex, int timerID,
                                       std::function<void()> cb)
 {
+    // Live pipelining: the k slots from the next one are open, so their
+    // timers run too.
+    bool const openSlot =
+        mHerder.nextConsensusLedgerIndex() == slotIndex ||
+        (mApp.getConfig().livePipelining() &&
+         slotIndex > mHerder.nextConsensusLedgerIndex() &&
+         slotIndex < mHerder.nextConsensusLedgerIndex() +
+                         mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH);
 #ifdef BUILD_TESTS
     if (timerID == Slot::NOMINATION_EMIT_TIMER)
     {
-        if (!mHerder.isTracking() ||
-            mHerder.nextConsensusLedgerIndex() == slotIndex)
+        if (!mHerder.isTracking() || openSlot)
         {
             cb();
         }
@@ -789,7 +936,7 @@ HerderSCPDriver::timerCallbackWrapper(uint64_t slotIndex, int timerID,
 #endif
 
     // reschedule timers for future slots when tracking
-    if (mHerder.isTracking() && mHerder.nextConsensusLedgerIndex() != slotIndex)
+    if (mHerder.isTracking() && !openSlot)
     {
         CLOG_WARNING(
             Herder, "Herder rescheduled timer {} for slot {} with next slot {}",
@@ -905,6 +1052,12 @@ HerderSCPDriver::computeTimeout(uint32 roundNumber, bool isNomination)
         }
     }
 
+    if (isNomination && mApp.getConfig().EXPERIMENTAL_NOMINATION_TIMEOUT_MS)
+    {
+        initialTimeoutMS = mApp.getConfig().EXPERIMENTAL_NOMINATION_TIMEOUT_MS;
+        incrementMS = initialTimeoutMS;
+    }
+
     auto timeoutMS = initialTimeoutMS + (roundNumber - 1) * incrementMS;
     if (timeoutMS > MAX_TIMEOUT_MS)
     {
@@ -991,7 +1144,8 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
 
     std::set<TransactionFramePtr> aggSet;
 
-    releaseAssert(!mLedgerManager.isApplying());
+    releaseAssert(!mLedgerManager.isApplying() ||
+                  mApp.getConfig().livePipelining());
     releaseAssert(threadIsMain());
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
 
@@ -1119,7 +1273,8 @@ HerderSCPDriver::combineCandidates(uint64_t slotIndex,
             // non-applicable candidate may be selected and is replaced with an
             // empty-tx-set value during balloting.
             ApplicableTxSetFrameConstPtr cApplicableTxSet = nullptr;
-            if (cTxSet && cTxSet->previousLedgerHash() == lcl.hash)
+            if (cTxSet &&
+                txSetBuildsOn(mApp, cTxSet->previousLedgerHash(), lcl))
             {
                 cApplicableTxSet = cTxSet->prepareForApply(mApp, lcl.header);
             }
@@ -1208,6 +1363,18 @@ void
 HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
 {
     ZoneScoped;
+    bool const pipeline = mApp.getConfig().livePipelining();
+    if (pipeline && mHerder.isTracking() &&
+        slotIndex > mHerder.trackingConsensusLedgerIndex() + 1)
+    {
+        // Live pipelining: N+1 externalized before N; deliver it after N.
+        // Bounded: a node that falls further behind recovers by catching up.
+        if (mPipelineEarlyExternalized.size() < 64)
+        {
+            mPipelineEarlyExternalized[slotIndex] = value;
+        }
+        return;
+    }
     auto it = mSCPTimers.begin(); // cancel all timers below this slot
     while (it != mSCPTimers.end() && it->first <= slotIndex)
     {
@@ -1253,7 +1420,7 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
             logQuorumInformationAndUpdateMetrics(slotIndex - 2);
         }
 
-        if (mCurrentValue)
+        if (mCurrentValue && (!pipeline || mLedgerSeqNominating <= slotIndex))
         {
             // stop nomination
             // this may or may not be the ledger that is currently externalizing
@@ -1285,6 +1452,21 @@ HerderSCPDriver::valueExternalized(uint64_t slotIndex, Value const& value)
     else
     {
         mHerder.valueExternalized(slotIndex, b, isLatestSlot);
+    }
+
+    if (pipeline)
+    {
+        mPipelineEarlyExternalized.erase(
+            mPipelineEarlyExternalized.begin(),
+            mPipelineEarlyExternalized.upper_bound(slotIndex));
+        auto it = mPipelineEarlyExternalized.find(slotIndex + 1);
+        if (it != mPipelineEarlyExternalized.end())
+        {
+            auto next = it->second;
+            mPipelineEarlyExternalized.erase(mPipelineEarlyExternalized.begin(),
+                                             std::next(it));
+            valueExternalized(slotIndex + 1, next);
+        }
     }
 }
 
@@ -1935,7 +2117,7 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         // might end up with malformed tx set that doesn't refer to the
         // LCL.
         ApplicableTxSetFrameConstPtr applicableTxSet;
-        if (txSet.previousLedgerHash() == lcl.hash)
+        if (txSetBuildsOn(mApp, txSet.previousLedgerHash(), lcl))
         {
             applicableTxSet = txSet.prepareForApply(mApp, lcl.header);
         }
@@ -1950,6 +2132,26 @@ HerderSCPDriver::checkAndCacheTxSetValid(TxSetXDRFrame const& txSet,
         }
         else
         {
+            // Live pipelining: a tx set built on N-k is checked against N-k,
+            // so every validator reaches the same result whatever its LCL.
+            std::optional<PipelineValidationBase> validationBase;
+            auto const depth =
+                mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+            if (mApp.getConfig().livePipelining())
+            {
+                auto baseSeq = recentLedgerSeqOf(
+                    mApp, txSet.previousLedgerHash(), lcl, depth);
+                if (baseSeq && *baseSeq < lcl.header.ledgerSeq)
+                {
+                    if (!mLedgerManager.getRecentLedgerHeader(*baseSeq))
+                    {
+                        // Not kept (after a restart): not valid for this
+                        // node now, and not cached.
+                        return false;
+                    }
+                    validationBase.emplace(mLedgerManager, *baseSeq);
+                }
+            }
             res = applicableTxSet->checkValid(mApp, closeTimeOffset.seconds(),
                                               closeTimeOffset.seconds());
         }
@@ -1979,7 +2181,8 @@ uint64
 HerderSCPDriver::getNodeWeight(NodeID const& nodeID, SCPQuorumSet const& qset,
                                bool const isLocalNode) const
 {
-    releaseAssert(!mLedgerManager.isApplying());
+    releaseAssert(!mLedgerManager.isApplying() ||
+                  mApp.getConfig().livePipelining());
     Config const& cfg = mApp.getConfig();
     bool const unsupportedProtocol = protocolVersionIsBefore(
         mApp.getLedgerManager()

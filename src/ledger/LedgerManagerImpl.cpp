@@ -78,6 +78,7 @@
 #include "LedgerManagerImpl.h"
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -596,6 +597,7 @@ LedgerManagerImpl::loadLastKnownLedgerInternal(bool skipBuildingFullState)
 
     CLOG_INFO(Ledger, "Loaded LCL header from database: {}",
               ledgerAbbrev(*currentLedger));
+    loadRecentLedgers(*currentLedger);
     setLedgerTxnHeader(*currentLedger, mApp);
     latestLedgerHeader = *currentLedger;
 
@@ -803,6 +805,144 @@ LedgerManagerImpl::getLastClosedLedgerHAS() const
     SharedLockShared guard(mLastClosedLedgerStateMutex);
     releaseAssert(mLastClosedLedgerState);
     return mLastClosedLedgerState->getLastClosedHistoryArchiveState();
+}
+
+// Live pipelining: tx sets may be built on a ledger up to k - 1 before the
+// LCL, and the k - 1 ledgers after an upgrade apply empty. Ledger headers
+// before the LCL are not kept in the database, so the hashes of the last few
+// ledgers, the last upgrade and the ledger where pipelining started are kept
+// in a small file next to the buckets, replaced on every apply. It is written
+// also with pipelining off, so that pipelining can be switched on at a
+// restart.
+static std::string
+recentLedgersPath(Application& app)
+{
+    return app.getConfig().BUCKET_DIR_PATH + "/recent-ledgers.txt";
+}
+
+void
+LedgerManagerImpl::loadRecentLedgers(LedgerHeader const& lcl)
+{
+    std::lock_guard<std::mutex> lock(mRecentHashesMutex);
+    mRecentHashes[lcl.ledgerSeq - 1] = lcl.previousLedgerHash;
+    std::ifstream in(recentLedgersPath(mApp));
+    std::string key, value;
+    std::optional<std::pair<uint32_t, uint32_t>> pipelineStart;
+    while (in >> key >> value)
+    {
+        if (key == "pipeline")
+        {
+            // "pipeline <k> <start ledger>"
+            uint32_t start;
+            in >> start;
+            pipelineStart.emplace(static_cast<uint32_t>(std::stoul(value)),
+                                  start);
+            continue;
+        }
+        uint32_t const seq =
+            static_cast<uint32_t>(std::stoul(key == "upgrade" ? value : key));
+        if (seq > lcl.ledgerSeq)
+        {
+            // Written before a commit that did not happen
+            continue;
+        }
+        if (key == "upgrade")
+        {
+            mLastUpgradeLedger = seq;
+        }
+        else if (seq + 1 < lcl.ledgerSeq &&
+                 seq + RECENT_LEDGERS_KEPT >= lcl.ledgerSeq)
+        {
+            mRecentHashes[seq] = hexToBin256(value);
+        }
+    }
+    // Switched on (or k changed) at this restart: the LCL is where it starts,
+    // the same on every node that switches at this ledger boundary.
+    auto const depth = mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    mPipelineStartLedger = pipelineStart && pipelineStart->first == depth &&
+                                   pipelineStart->second <= lcl.ledgerSeq
+                               ? pipelineStart->second
+                               : lcl.ledgerSeq;
+}
+
+uint32_t
+LedgerManagerImpl::getPipelineStartLedger() const
+{
+    return std::max(mPipelineStartLedger, GENESIS_LEDGER_SEQ);
+}
+
+void
+LedgerManagerImpl::storeRecentLedgerHash(uint32_t ledgerSeq, Hash const& hash)
+{
+    {
+        std::lock_guard<std::mutex> lock(mRecentHashesMutex);
+        mRecentHashes[ledgerSeq] = hash;
+        while (mRecentHashes.size() > RECENT_LEDGERS_KEPT)
+        {
+            mRecentHashes.erase(mRecentHashes.begin());
+        }
+    }
+    writeRecentLedgers();
+}
+
+void
+LedgerManagerImpl::writeRecentLedgers()
+{
+    // Apply thread. Written to a new file and renamed, so a crash leaves
+    // either the old file or the new one.
+    std::map<uint32_t, Hash> hashes;
+    {
+        std::lock_guard<std::mutex> lock(mRecentHashesMutex);
+        hashes = mRecentHashes;
+    }
+    auto const path = recentLedgersPath(mApp);
+    {
+        std::ofstream out(path + ".tmp", std::ios::trunc);
+        for (auto const& [seq, h] : hashes)
+        {
+            out << seq << " " << binToHex(h) << "\n";
+        }
+        if (mLastUpgradeLedger != 0)
+        {
+            out << "upgrade " << mLastUpgradeLedger << "\n";
+        }
+        if (mApp.getConfig().livePipelining())
+        {
+            out << "pipeline "
+                << mApp.getConfig().EXPERIMENTAL_LIVE_PIPELINE_DEPTH << " "
+                << mPipelineStartLedger << "\n";
+        }
+    }
+    std::filesystem::rename(path + ".tmp", path);
+}
+
+std::optional<LedgerHeaderHistoryEntry>
+LedgerManagerImpl::getRecentLedgerHeader(uint32_t ledgerSeq) const
+{
+    releaseAssert(threadIsMain());
+    auto const& lcl = getLastClosedLedgerHeader();
+    if (lcl.header.ledgerSeq == ledgerSeq)
+    {
+        return lcl;
+    }
+    auto it = mRecentStates.find(ledgerSeq);
+    if (it == mRecentStates.end())
+    {
+        return std::nullopt;
+    }
+    return it->second->getLastClosedLedgerHeader();
+}
+
+std::optional<Hash>
+LedgerManagerImpl::getRecentLedgerHash(uint32_t ledgerSeq) const
+{
+    std::lock_guard<std::mutex> lock(mRecentHashesMutex);
+    auto it = mRecentHashes.find(ledgerSeq);
+    if (it == mRecentHashes.end())
+    {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 uint32_t
@@ -1676,6 +1816,7 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     JITTER_INJECT_DELAY();
 
     auto ledgerTime = mApplyState.getMetrics().mLedgerClose.TimeScope();
+    auto const logBegin = std::chrono::steady_clock::now();
     LogSlowExecution applyLedgerTime{"applyLedger",
                                      LogSlowExecution::Mode::MANUAL, "",
                                      std::chrono::milliseconds::max()};
@@ -1694,10 +1835,29 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     }
 #endif
     auto prevHash = xdrSha256(prevHeader);
+    storeRecentLedgerHash(prevHeader.ledgerSeq, prevHash);
 
     auto initialLedgerVers = header.current().ledgerVersion;
     ++header.current().ledgerSeq;
     header.current().previousLedgerHash = prevHash;
+
+    // Live pipelining: the k - 1 ledgers after an upgrade were validated under
+    // the rules before it, so none of their transactions is applied; they stay
+    // in the queue for a later ledger. The ledger keeps its value and tx set,
+    // also in history, so catchup, which applies the same rule, gets the same
+    // result.
+    auto const& cfg = mApp.getConfig();
+    bool const drained =
+        cfg.livePipelining() && mLastUpgradeLedger != 0 &&
+        ledgerData.getLedgerSeq() > mLastUpgradeLedger &&
+        ledgerData.getLedgerSeq() <
+            mLastUpgradeLedger + cfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH;
+    if (drained)
+    {
+        CLOG_INFO(Ledger,
+                  "PipelineLive event=drained ledger={} after_upgrade={}",
+                  ledgerData.getLedgerSeq(), mLastUpgradeLedger);
+    }
     CLOG_DEBUG(Ledger, "starting applyLedger() on ledgerSeq={}",
                header.current().ledgerSeq);
 
@@ -1731,7 +1891,15 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     }
     JITTER_INJECT_DELAY();
 
-    if (txSet->previousLedgerHash() != prevHash)
+    if (txSet->previousLedgerHash() != prevHash &&
+        !(cfg.livePipelining() && [&] {
+            // Live pipelining: built on N-k, k - 1 ledgers before this one's
+            // parent at most.
+            LedgerHeaderHistoryEntry prev;
+            prev.hash = prevHash;
+            prev.header = prevHeader;
+            return txSetBuildsOn(mApp, txSet->previousLedgerHash(), prev);
+        }()))
     {
         CLOG_ERROR(Ledger, "TxSet mismatch: LCD wants {}, LCL is {}",
                    ledgerAbbrev(ledgerData.getLedgerSeq() - 1,
@@ -1771,9 +1939,39 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
 
     auto const& sv = ledgerData.getValue();
     header.current().scpValue = sv;
+    if (cfg.livePipelining())
+    {
+        // Live pipelining: N was nominated before N-1 externalized, so its
+        // close time may not follow N-1. Apply it at N-1's close time plus the
+        // smallest step instead, the same on every node.
+        auto const prevCloseTime = getConsensusTime(prevHeader.scpValue);
+        auto& value = header.current().scpValue;
+        if (getConsensusTime(value) <= prevCloseTime)
+        {
+            auto const ct = prevCloseTime.next(header.current().ledgerVersion);
+            value.closeTime = ct.toApplyTime().timePoint();
+            if (value.ext.v() == STELLAR_VALUE_SIGNED_MS)
+            {
+                value.ext.signedMsValue().closeTimeMs = ct.milliseconds();
+            }
+            else if (value.ext.v() == STELLAR_VALUE_EMPTY_TX_SET_MS)
+            {
+                value.ext.proposedMsValue().closeTimeMs = ct.milliseconds();
+            }
+            CLOG_INFO(Ledger,
+                      "PipelineLive event=closetime_raised ledger={} by_ms={}",
+                      header.current().ledgerSeq,
+                      ct.milliseconds() - getConsensusTime(sv).milliseconds());
+        }
+    }
 
     maybeResetLedgerCloseMetaDebugStream(header.current().ledgerSeq);
-    auto applicableTxSet = txSet->prepareForApply(mApp, prevHeader);
+    // The transactions applied: none for a drained ledger.
+    TxSetXDRFrameConstPtr const applyTxSet =
+        drained
+            ? TxSetXDRFrame::makeEmpty(prevHash, header.current().ledgerVersion)
+            : txSet;
+    auto applicableTxSet = applyTxSet->prepareForApply(mApp, prevHeader);
 
     if (applicableTxSet == nullptr)
     {
@@ -1805,7 +2003,7 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
         ledgerCloseMeta = std::make_unique<LedgerCloseMetaFrame>(
             header.current().ledgerVersion);
         ledgerCloseMeta->reserveTxProcessing(applicableTxSet->sizeTxTotal());
-        ledgerCloseMeta->populateTxSet(*txSet);
+        ledgerCloseMeta->populateTxSet(*applyTxSet);
     }
 
 #ifdef BUILD_TESTS
@@ -1816,7 +2014,7 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
         ledgerCloseMeta = std::make_unique<LedgerCloseMetaFrame>(
             header.current().ledgerVersion);
         ledgerCloseMeta->reserveTxProcessing(applicableTxSet->sizeTxTotal());
-        ledgerCloseMeta->populateTxSet(*txSet);
+        ledgerCloseMeta->populateTxSet(*applyTxSet);
     }
 #endif
 
@@ -1830,11 +2028,12 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     // we merge all the metric containers together without worrying about their
     // order or origin.
     std::vector<SorobanApplyMetrics> sorobanApplyMetricsPerThread(1);
+    std::chrono::nanoseconds totalTxApplyDuration{0};
 #ifdef BUILD_TESTS
     if (mApp.getRunInOverlayOnlyMode())
     {
-        auto numTxs = txSet->sizeTxTotal();
-        auto numOps = txSet->sizeOpTotalForLogging();
+        auto numTxs = applyTxSet->sizeTxTotal();
+        auto numOps = applyTxSet->sizeOpTotalForLogging();
         auto numClassicTxs = applicableTxSet->sizeTx(TxSetPhase::CLASSIC);
         auto numSorobanTxs = applicableTxSet->sizeTx(TxSetPhase::SOROBAN);
         auto ledgerSeq = header.current().ledgerSeq;
@@ -1874,6 +2073,7 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
         txResultSet =
             applyTransactions(*applicableTxSet, mutableTxResults, ltx,
                               ledgerCloseMeta, sorobanApplyMetricsPerThread);
+        totalTxApplyDuration = totalTxApplyTime.Stop();
     }
 
     auto ledgerSeq = ltx.loadHeader().current().ledgerSeq;
@@ -1928,6 +2128,10 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
             }
             ltxUpgrade.commit();
             upgradeApplied = true;
+            // Recorded before the commit below: after a restart the drained
+            // ledgers must still apply empty.
+            mLastUpgradeLedger = ledgerData.getLedgerSeq();
+            writeRecentLedgers();
         }
         catch (std::runtime_error& e)
         {
@@ -2088,27 +2292,39 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     maybeRunSnapshotInvariantFromLedgerState(mApplyState.copyApplyLedgerView());
 
 #ifdef BUILD_TESTS
-    maybeSimulateSleep(mApp.getConfig(), txSet->sizeOpTotalForLogging(),
+    maybeSimulateSleep(mApp.getConfig(), applyTxSet->sizeOpTotalForLogging(),
                        applyLedgerTime, mApplySleepRng);
     recordTxE2eLatency(*applicableTxSet);
 #endif
+
+    // Herder takes the applied transactions out of its queue: none for a
+    // drained ledger (an empty-tx-set value carries no tx set hash).
+    LedgerCloseData const notifyData = [&] {
+        if (!drained)
+        {
+            return ledgerData;
+        }
+        StellarValue value = ledgerData.getValue();
+        value.txSetHash = Herder::EMPTY_TX_SET_HASH;
+        return LedgerCloseData(ledgerData.getLedgerSeq(), applyTxSet, value);
+    }();
 
     // Steps 6, 7, 8 are done in `completeLedgerClose`
     // NB: appliedLedgerState is invalidated after this call.
     if (threadIsMain())
     {
-        completeLedgerClose(ledgerSeq, calledViaExternalize, ledgerData,
+        completeLedgerClose(ledgerSeq, calledViaExternalize, notifyData,
                             std::move(appliedLedgerState), upgradeApplied,
                             std::move(sorobanApplyMetricsPerThread));
     }
     else
     {
-        auto cb = [this, ledgerSeq, calledViaExternalize, ledgerData,
+        auto cb = [this, ledgerSeq, calledViaExternalize, notifyData,
                    appliedLedgerState = std::move(appliedLedgerState),
                    upgradeApplied,
                    sorobanApplyMetricsPerThread =
                        std::move(sorobanApplyMetricsPerThread)]() mutable {
-            completeLedgerClose(ledgerSeq, calledViaExternalize, ledgerData,
+            completeLedgerClose(ledgerSeq, calledViaExternalize, notifyData,
                                 std::move(appliedLedgerState), upgradeApplied,
                                 std::move(sorobanApplyMetricsPerThread));
         };
@@ -2118,6 +2334,18 @@ LedgerManagerImpl::applyLedger(LedgerCloseData const& ledgerData,
     std::chrono::duration<double> ledgerTimeSeconds = ledgerTime.Stop();
     CLOG_DEBUG(Perf, "Applied ledger {} in {} seconds", ledgerSeq,
                ledgerTimeSeconds.count());
+    // Apply times for the live pipelining timeline (scripts/wan-analyze.py):
+    // the whole of applyLedger, the transactions, and its start and end on
+    // the steady clock.
+    auto const ns = [](auto d) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+    };
+    CLOG_INFO(Perf,
+              "PipelineApply ledger={} close_ns={} total_apply_ns={} "
+              "t_begin_ns={} t_end_ns={}",
+              ledgerSeq, ns(ledgerTimeSeconds), totalTxApplyDuration.count(),
+              ns(logBegin.time_since_epoch()),
+              ns(std::chrono::steady_clock::now().time_since_epoch()));
     FrameMark;
 }
 
@@ -2330,6 +2558,34 @@ LedgerManagerImpl::advanceLastClosedLedgerState(
         }
         mLastClosedLedgerState = appliedLedgerState;
     }
+    if (mApp.getConfig().livePipelining())
+    {
+        mRecentStates[appliedLedgerState->getLastClosedLedgerHeader()
+                          .header.ledgerSeq] = appliedLedgerState;
+        while (mRecentStates.size() > RECENT_LEDGERS_KEPT)
+        {
+            mRecentStates.erase(mRecentStates.begin());
+        }
+    }
+}
+
+void
+LedgerManagerImpl::setPipelineValidationBase(std::optional<uint32_t> ledgerSeq)
+{
+    releaseAssert(threadIsMain());
+    mPipelineValidationBase = ledgerSeq;
+}
+
+PipelineValidationBase::PipelineValidationBase(LedgerManager& lm,
+                                               std::optional<uint32_t> seq)
+    : mLedgerManager(lm)
+{
+    mLedgerManager.setPipelineValidationBase(seq);
+}
+
+PipelineValidationBase::~PipelineValidationBase()
+{
+    mLedgerManager.setPipelineValidationBase(std::nullopt);
 }
 
 ImmutableLedgerDataPtr
@@ -2458,6 +2714,16 @@ LedgerManagerImpl::getLCLView() const
         return std::make_unique<OwnedLedgerTxnView>(mApp.getLedgerTxnRoot());
     }
 #endif
+    if (threadIsMain() && mPipelineValidationBase)
+    {
+        // Callers check that the state of the base is kept (see
+        // getRecentLedgerHeader): validating against another state would
+        // make this node disagree with the others.
+        auto it = mRecentStates.find(*mPipelineValidationBase);
+        releaseAssert(it != mRecentStates.end());
+        return std::make_unique<ImmutableLedgerView>(it->second,
+                                                     mApp.getMetrics());
+    }
     return std::make_unique<ImmutableLedgerView>(copyImmutableLedgerView());
 }
 

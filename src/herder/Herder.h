@@ -20,6 +20,24 @@
 
 namespace stellar
 {
+class TransactionFrameBase;
+
+// Live pipelining (EXPERIMENTAL_LIVE_PIPELINE_DEPTH = k >= 2): the open slots
+// take transactions from disjoint accounts, by the account key modulo k.
+bool pipelineAccountInSlot(AccountID const& account, uint64_t ledgerSeq,
+                           uint32_t depth);
+// Whether the transaction belongs to the slot of `ledgerSeq`: its class is
+// that of the account that pays its fee. A payer is then never charged in two
+// open slots validated against the same stale balance. Other accounts it
+// touches may appear in another open slot; such a conflict fails at apply,
+// deterministically, and is still paid for.
+bool pipelineTxInSlot(TransactionFrameBase const& tx, uint64_t ledgerSeq,
+                      uint32_t depth);
+// The ledger the value of `ledgerSeq` is built on: N-k, or the ledger where
+// pipelining started (`startLedger`, see LedgerManager) for the first k - 1
+// ledgers after it.
+uint32_t pipelineBaseLedger(uint64_t ledgerSeq, uint32_t depth,
+                            uint32_t startLedger);
 
 // Returned by getTxSet to distinguish "empty tx set" values (no real tx set)
 // from "not yet downloaded" (nullptr).

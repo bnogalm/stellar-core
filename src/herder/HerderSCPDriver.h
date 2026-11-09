@@ -95,6 +95,8 @@ class HerderSCPDriver : public SCPDriver
 
     // Returns true iff the protocol allows CAP-0083 empty-tx-set values
     bool protocolAllowsEmptyTxSetValues() const override;
+    size_t getNominationLeaderCount() const override;
+    bool simulateDosOnTopLeader() const override;
 
     // Returns true iff the protocol uses millisecond-resolution close times.
     bool protocolUsesMsCloseTime() const;
@@ -322,6 +324,16 @@ class HerderSCPDriver : public SCPDriver
 
     uint32_t mLedgerSeqNominating;
     ValueWrapperPtr mCurrentValue;
+    // Live pipelining: slots externalized before the previous one, delivered
+    // in order.
+    std::map<uint64_t, Value> mPipelineEarlyExternalized;
+    // Live pipelining: whether a tx set only uses the fee payers of its slot.
+    bool pipelinePartitionValid(TxSetXDRFrame const& txSet,
+                                uint64_t slotIndex) const;
+    // Live pipelining: whether a tx set for N is built on exactly N-k.
+    bool pipelineBaseValid(TxSetXDRFrame const& txSet, uint64_t slotIndex,
+                           LedgerHeaderHistoryEntry const& lcl) const;
+    mutable std::map<std::pair<Hash, uint64_t>, bool> mPipelinePartitionCache;
 
     // timers used by SCP
     // indexed by slotIndex, timerID

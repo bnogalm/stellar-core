@@ -69,7 +69,8 @@ uint32_t const LoadGenerator::STEP_MSECS = 100;
 uint32_t const LoadGenerator::TX_SUBMIT_MAX_TRIES = 10;
 
 // After successfully submitting desired load, wait a bit to let it get into the
-// ledger.
+// ledger. With live pipelining (depth k) a transaction can wait about 2k
+// ledgers for its turn, so this is k times longer.
 uint32_t const LoadGenerator::TIMEOUT_NUM_LEDGERS = 20;
 
 // After successfully submitting desired load, wait for this many ledgers
@@ -1403,7 +1404,11 @@ LoadGenerator::waitTillComplete(GeneratedLoadConfig cfg)
     // If we have an inconsistency, reset the timer and wait for another ledger
     else if (!classicIsDone || !sorobanIsDone)
     {
-        if (++mWaitTillCompleteForLedgers >= TIMEOUT_NUM_LEDGERS)
+        auto const& appCfg = mApp.getConfig();
+        if (++mWaitTillCompleteForLedgers >=
+            TIMEOUT_NUM_LEDGERS * (appCfg.livePipelining()
+                                       ? appCfg.EXPERIMENTAL_LIVE_PIPELINE_DEPTH
+                                       : 1))
         {
             emitFailure(!sorobanIsDone);
             return;

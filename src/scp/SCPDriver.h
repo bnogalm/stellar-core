@@ -196,6 +196,21 @@ class SCPDriver
     // The protocol version allows the use of STELLAR_VALUE_EMPTY_TX_SET
     virtual bool protocolAllowsEmptyTxSetValues() const = 0;
 
+    // Nomination leaders per round: the nodes with the highest priority.
+    virtual size_t
+    getNominationLeaderCount() const
+    {
+        return 1;
+    }
+
+    // Testing: stay silent in the first nomination round of a slot where the
+    // local node has the top priority (a targeted DoS on predicted leaders).
+    virtual bool
+    simulateDosOnTopLeader() const
+    {
+        return false;
+    }
+
     // `getValueString` is used for debugging
     // default implementation is the hash of the value
     virtual std::string getValueString(Value const& v) const;

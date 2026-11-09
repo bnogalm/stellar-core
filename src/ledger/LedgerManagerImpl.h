@@ -23,6 +23,8 @@
 #include "xdr/Stellar-ledger.h"
 #include <atomic>
 #include <filesystem>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -318,6 +320,28 @@ class LedgerManagerImpl : public LedgerManager
     // to main thread. This means the apply snapshot may be ahead of
     // mLastClosedLedgerState at any given point.
     mutable ANNOTATED_SHARED_MUTEX(mLastClosedLedgerStateMutex);
+
+    // Live pipelining (EXPERIMENTAL_LIVE_PIPELINE_DEPTH = k >= 2). Ledgers
+    // kept, enough for k up to 16.
+    static constexpr size_t RECENT_LEDGERS_KEPT = 16;
+    // Hashes of the last few applied ledgers, written by the apply thread
+    // and read by the main thread.
+    mutable std::mutex mRecentHashesMutex;
+    std::map<uint32_t, Hash> mRecentHashes;
+    // With live pipelining on, the last few LCL states (main thread), and the
+    // one validation reads while a tx set built on it is built or checked.
+    std::map<uint32_t, ImmutableLedgerDataPtr> mRecentStates;
+    std::optional<uint32_t> mPipelineValidationBase;
+    // The last ledger that applied an upgrade (apply thread). The next k - 1
+    // ledgers were validated under the rules before it, so they apply with
+    // an empty tx set.
+    uint32_t mLastUpgradeLedger{0};
+    // Where pipelining with the configured k started: read from the file, or
+    // the LCL at startup when it is switched on (set at startup).
+    uint32_t mPipelineStartLedger{0};
+    void loadRecentLedgers(LedgerHeader const& lcl);
+    void storeRecentLedgerHash(uint32_t ledgerSeq, Hash const& hash);
+    void writeRecentLedgers();
     ImmutableLedgerDataPtr
         mLastClosedLedgerState GUARDED_BY(mLastClosedLedgerStateMutex);
 
@@ -565,6 +589,11 @@ class LedgerManagerImpl : public LedgerManager
     uint32_t getLastReserve() const override;
     uint32_t getLastTxFee() const override;
     uint32_t getLastClosedLedgerNum() const override;
+    std::optional<Hash> getRecentLedgerHash(uint32_t ledgerSeq) const override;
+    std::optional<LedgerHeaderHistoryEntry>
+    getRecentLedgerHeader(uint32_t ledgerSeq) const override;
+    uint32_t getPipelineStartLedger() const override;
+    void setPipelineValidationBase(std::optional<uint32_t> ledgerSeq) override;
     SorobanNetworkConfig const&
     getLastClosedSorobanNetworkConfig() const override;
 
